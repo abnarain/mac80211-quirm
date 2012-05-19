@@ -339,10 +339,10 @@ static struct sk_buff *
 
 	if (local->hw.flags & IEEE80211_HW_RX_INCLUDES_FCS)
 		present_fcs_len = FCS_LEN;
-
-  if(astro <5)
-     printk("abhinav befor may_pull :  headlen=%d skb=%p head=%p data=%p tail=%p end=%p \n", skb_headroom(origskb), origskb, origskb->head, origskb->data, origskb->tail,origskb->end );
-
+  if(astro <5){
+					printk("abhinav: Sampling init ! \n");
+//     printk("abhinav befor may_pull :  headlen=%d skb=%p head=%p data=%p tail=%p end=%p \n", skb_headroom(origskb), origskb, origskb->head, origskb->data, origskb->tail,origskb->end );
+	}
 	/* make sure hdr->frame_control is on the linear part */
 
 	if (!pskb_may_pull(origskb, 2+ sizeof(struct ath9k_radiotap ))) { // this works for paged rx, its redundant for our hardware
@@ -351,7 +351,7 @@ static struct sk_buff *
 	}
 
 	if(astro <5){
-	 	printk("abhinav after may_pull : headlen=%d skb=%p head=%p data=%p tail=%p end=%p \n", skb_headroom(origskb), origskb,origskb->head, origskb->data,origskb->tail, origskb->end);
+	// 	printk("abhinav after may_pull : headlen=%d skb=%p head=%p data=%p tail=%p end=%p \n", skb_headroom(origskb), origskb,origskb->head, origskb->data,origskb->tail, origskb->end);
 	 	astro++;
 	}
 
@@ -367,19 +367,21 @@ static struct sk_buff *
 		return remove_monitor_info_jigs(local, status, origskb, &custum_hdr);
 #endif
 	}
-
+	static int sampling =0;
+	int which_one=0;
 	if (should_drop_frame(origskb, present_fcs_len)) {
 		/* only need to expand headroom if necessary */
+/*		if(status != NULL) crashes the kernel in 210 seconds  
+		  if(status->mactime & 0x1) { 
+		    if(sampling <2 ) 
+		      printk("abhinav: Sampling ON %d \n",sampling++ ); 	    
+		    origskb = remove_monitor_info_jigs(local,status, origskb,&custum_hdr);
+		    return NULL ;
+		  }
+		*/	
 		skb = origskb;
 		origskb = NULL;
-		static int stake=0;
-		if(stake <5) {
-		printk("abhinav: THIS should NOT HAPPEN headroom=%d needed=%d start \n ",skb_headroom(skb),needed_headroom	);
-		}
-//		skb = remove_monitor_info_jigs(local,status, skb,&custum_hdr);
-		if(stake <5) {
-		printk("abhinav: THIS should NOT HAPPEN headroom=%d needed=%d %d\n ",skb_headroom(skb),needed_headroom	,stake++);
-		}
+		which_one=1; 	  
 		/*
 		 * This shouldn't trigger often because most devices have an
 		 * RX header they pull before we get here, and that should
@@ -403,22 +405,25 @@ static struct sk_buff *
 		 * and FCS from the original.
 		 */
 		//skb = skb_copy_expand(origskb, needed_headroom, 0, GFP_ATOMIC);
-
+	  
 #ifndef JIGS
 		origskb = remove_monitor_info(local, origskb);
 #else
 		static int asl21=0;
-		if (asl21<5)
-	printk("abhinav: REMOVE monitorinfo ORIGSKB %d\n", asl21++);
-	
+		if (asl21<5){
+		//	printk("abhinav: REMOVE monitorinfo ORIGSKB %d\n", asl21++);
+		}
 		skb=skb_copy(origskb,GFP_ATOMIC); 
 		origskb = remove_monitor_info_jigs(local,status, origskb,&custum_hdr);
+
+
 #endif
-		
 		
 		if (!skb)
 			return origskb;
 	}
+
+
 
 
 	/* prepend radiotap information */
@@ -434,6 +439,10 @@ static struct sk_buff *
 	skb->pkt_type = PACKET_OTHERHOST;
 	skb->protocol = htons(ETH_P_802_2);
 
+		if(status != NULL)
+		  if(status->mactime & 0x1) {							
+					goto kill;
+			}
 	list_for_each_entry_rcu(sdata, &local->interfaces, list) {
 		if (sdata->vif.type != NL80211_IFTYPE_MONITOR)
 			continue;
@@ -456,7 +465,8 @@ static struct sk_buff *
 		sdata->dev->stats.rx_packets++;
 		sdata->dev->stats.rx_bytes += skb->len;
 	}
-
+kill : 
+	
 	if (prev_dev) {
 		skb->dev = prev_dev;
 		netif_receive_skb(skb);

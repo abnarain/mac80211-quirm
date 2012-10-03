@@ -1814,7 +1814,7 @@ static void ath9k_radiotap_add(struct ath_softc *sc,
     static int avb2=0;
     if(avb2<5){      
       if ((unsigned long)rt % __alignof__(struct ath9k_radiotap) == 0)
-	printk("abhinav: in driver align \n");      
+	printk("abhinav: in driver align; latest driver \n");      
       avb2++;
     }
     rt->jig.version_ = JIGDUMP_HDR_VERSION;
@@ -1825,7 +1825,20 @@ static void ath9k_radiotap_add(struct ath_softc *sc,
     rt->hdr.it_len = cpu_to_le16(rt_len); // size of whole header
     rt->jig.hdrlen_ = jhsz;
 
-    rt->jig.rssi_   =  rs->rs_rssi;
+
+   
+    if(rs->rs_rssi != ATH9K_RSSI_BAD && !rs->rs_moreaggr)
+      rt->jig.rssi_ = rs->rs_rssi;
+    else 
+      rt->jig.rssi_ = -127;
+
+    /*if ( (rs->rs_status & ATH9_RXERR_CRC) || (rs->rs_status & ATH9K_RXERR_PHY) || (rs->rs_status & ATH9K_RXERR_DECRYPT  ) || (rs->rs_status & ATH9K_RXERR_MIC ) ||   rs->rs_status & ATH9K_RXERR_KEYMISS  ) 
+      {
+      rt->jig.rssi_ = -127;
+      static int honey=0;
+      if (honey <5)
+      printk("abhinav: other err %d \n",honey++);									
+      }*/
 
     rt->jig.ofdm_phyerr_ =  ah->stats.ast_ani_ofdmerrs ;
     rt->jig.cck_phyerr_ =  ah->stats.ast_ani_cckerrs ;
@@ -1876,11 +1889,11 @@ void ath_rx_radiotap(struct ath_softc *sc,
       goto fail;
     }
     if(asl<5){
-      printk("abhinav: before ath_add headroom=%d skb=%p, skb->head=%p skb->data=%p skb->tail=%p skb->end=%p  %d\n",skb_headroom(skb),skb,skb->head,skb->data,skb->tail,skb->end,asl);
+//      printk("abhinav: before ath_add headroom=%d skb=%p, skb->head=%p skb->data=%p skb->tail=%p skb->end=%p  %d\n",skb_headroom(skb),skb,skb->head,skb->data,skb->tail,skb->end,asl);
     }
     ath9k_radiotap_add(sc, skb, rs, rt_len);
     if(asl<5){
-      printk("abhinav: after ath_add  headroom=%d skb=%p, skb->head=%p skb->data=%p skb->tail=%p skb->end=%p, %d \n",skb_headroom(skb),skb,skb->head,skb->data,skb->tail,skb->end ,asl);
+  //    printk("abhinav: after ath_add  headroom=%d skb=%p, skb->head=%p skb->data=%p skb->tail=%p skb->end=%p, %d \n",skb_headroom(skb),skb,skb->head,skb->data,skb->tail,skb->end ,asl);
       asl++;
     }
  fail:

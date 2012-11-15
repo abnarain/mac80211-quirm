@@ -29,7 +29,7 @@ struct jigdump_hdr
 	u_int32_t phyerr_;
 	u_int32_t cck_phyerr_;
 	u_int32_t ofdm_phyerr_;
-	u_int32_t total_pkts_ ;
+//	u_int32_t total_pkts_ ;
 
 	u_int16_t flags_;//int
 	u_int16_t freq_ ;//int 
@@ -37,6 +37,7 @@ struct jigdump_hdr
 	u_int16_t channel_;
 	u_int16_t caplen_;
 
+	u_int64_t mac_tsf_ ; 
 } __attribute__((packed));
 
 struct custom_hdr_t {
@@ -47,7 +48,7 @@ struct custom_hdr_t {
   u32 hw_cntr_ofdmerr ;
   u32 hw_cntr_cckerr ;
   u32 phy_err ;
-	u32 total_pkts;
+//	u32 total_pkts;
 
 } __attribute__((packed));
 

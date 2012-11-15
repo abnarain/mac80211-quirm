@@ -1842,8 +1842,8 @@ static void ath9k_radiotap_add(struct ath_softc *sc,
 
     rt->jig.ofdm_phyerr_ =  ah->stats.ast_ani_ofdmerrs ;
     rt->jig.cck_phyerr_ =  ah->stats.ast_ani_cckerrs ;
-    rt->jig.phyerr_ = sc->debug.stats.rxstats.phy_err;
-    rt->jig.total_pkts_ =  sc->debug.stats.rxstats.rx_pkts_all;
+    rt->jig.phyerr_ = 1 ; //sc->debug.stats.rxstats.phy_err;
+//    rt->jig.total_pkts_ =  sc->debug.stats.rxstats.rx_pkts_all;
 
     rt->jig.freq_   = status->freq;
     rt->jig.flags_  = status->flag;

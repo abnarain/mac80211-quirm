@@ -171,13 +171,16 @@ static void
 	} else {
 	  a9k->jig.rate_= rate->bitrate / 5;
 	}
-	/*
+		a9k->jig.mac_tsf_ = status->mactime ; 
+	
 	  static int ab23=0;
 	  if(ab23<5){
-	  printk("abhinav: crc err %d  and antenna: %d : err : ofdm=%u cck=%u phy=%u \n",
-	  ab23 ,  status->antenna,jig->ofdm_phyerr_, jig->cck_phyerr_ , jig->phyerr_);
+//	  printk("abhinav: crc err %d  and antenna: %d : err : ofdm=%u cck=%u phy=%u \n",
+//	  ab23 ,  status->antenna,jig->ofdm_phyerr_, jig->cck_phyerr_ , jig->phyerr_);
+			printk("abhinav: mactime = %lu , %d \n",status->mactime, ab23++);
+
 	  }
-	*/
+
 
 
 #else
@@ -439,10 +442,11 @@ static struct sk_buff *
 	skb->pkt_type = PACKET_OTHERHOST;
 	skb->protocol = htons(ETH_P_802_2);
 
-		if(status != NULL)
+/*		if(status != NULL)
 		  if(status->mactime & 0x1) {							
 					goto kill;
 			}
+			*/
 	list_for_each_entry_rcu(sdata, &local->interfaces, list) {
 		if (sdata->vif.type != NL80211_IFTYPE_MONITOR)
 			continue;
@@ -465,7 +469,7 @@ static struct sk_buff *
 		sdata->dev->stats.rx_packets++;
 		sdata->dev->stats.rx_bytes += skb->len;
 	}
-kill : 
+//kill : 
 	
 	if (prev_dev) {
 		skb->dev = prev_dev;

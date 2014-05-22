@@ -1,0 +1,736 @@
+diff --git a/drivers/net/wireless/ath/ath9k/ani.h b/drivers/net/wireless/ath/ath9k/ani.h
+index 83029d6..47e9520 100644
+--- a/drivers/net/wireless/ath/ath9k/ani.h
++++ b/drivers/net/wireless/ath/ath9k/ani.h
+@@ -152,6 +152,9 @@ struct ar5416Stats {
+ 	u32 ast_ani_lneg_or_lzero;
+ 	u32 avgbrssi;
+ 	struct ath9k_mib_stats ast_mibstats;
++    u32 prev_ast_ani_ofdmerrs; /*_HOMESAW*/
++    u32 prev_ast_ani_cckerrs; /*_HOMESAW*/
++
+ };
+ #define ah_mibStats stats.ast_mibstats
+ 
+diff --git a/drivers/net/wireless/ath/ath9k/ath9k.h b/drivers/net/wireless/ath/ath9k/ath9k.h
+index 93b45b4..e9345d6 100644
+--- a/drivers/net/wireless/ath/ath9k/ath9k.h
++++ b/drivers/net/wireless/ath/ath9k/ath9k.h
+@@ -27,6 +27,36 @@
+ #include "common.h"
+ #include "mci.h"
+ 
++#define _HOMESAW_
++#ifdef _HOMESAW_
++#include <net/ieee80211_radiotap.h>
++
++struct homesaw{
++  u_int32_t phyerr_;
++  u_int32_t cck_phyerr_;
++  u_int32_t ofdm_phyerr_;
++  u_int32_t time_buf_dur_;
++
++  u_int16_t caplen_ ;
++  int8_t rssi_ ;
++  s8 noise_ ;
++} __packed ;
++
++struct ath9k_radiotap {
++  struct ieee80211_radiotap_header hdr;
++  /* Vendor extension header */
++  u8 oui[3];
++  u8 sub_namespace;
++  __le16 skip_length;
++  //custom data structure
++  struct homesaw hs ;
++} __packed;
++
++#endif
++
++
++
++
+ /*
+  * Header for the ath9k.ko driver core *only* -- hw code nor any other driver
+  * should rely on this file or its contents.
+@@ -230,6 +260,22 @@ struct ath_buf {
+ 	dma_addr_t bf_buf_addr;	/* physical addr of data buffer, for DMA */
+ 	bool bf_stale;
+ 	struct ath_buf_state bf_state;
++        /* _HOMESAW_ This is a clever way to modify the private/internal datastructure 
++	   of ath9k driver to temporarily save the enqueue timestamp of the frame
++	   in the ath9k driver queue, so that one can later save the difference.
++	   This is done because one can only use 40 bytes per skb, in the sk_buff
++	   private data ; so we are limited by what we can communicate, but this is
++	   a way around!
++        */ 
++#ifdef _HOMESAW_
++        u64 timestamp_temp; /*_HOMESAW_*/
++        u64 enqueue_time ; /*_HOMESAW_*/
++        u16 axq_ampdu_depth;
++        u16 axq_depth;
++        u8 axq_num;
++        u8 phy_f;
++#endif 
++
+ };
+ 
+ struct ath_atx_tid {
+diff --git a/drivers/net/wireless/ath/ath9k/debug.h b/drivers/net/wireless/ath/ath9k/debug.h
+index 356352a..8065217 100644
+--- a/drivers/net/wireless/ath/ath9k/debug.h
++++ b/drivers/net/wireless/ath/ath9k/debug.h
+@@ -164,6 +164,7 @@ struct ath_rx_stats {
+ 	u32 post_delim_crc_err;
+ 	u32 decrypt_busy_err;
+ 	u32 phy_err_stats[ATH9K_PHYERR_MAX];
++    u32 prev_phy_err  ;/*_HOMESAW_ */
+ 	int8_t rs_rssi_ctl0;
+ 	int8_t rs_rssi_ctl1;
+ 	int8_t rs_rssi_ctl2;
+diff --git a/drivers/net/wireless/ath/ath9k/recv.c b/drivers/net/wireless/ath/ath9k/recv.c
+index 67b862c..bd27f4e 100644
+--- a/drivers/net/wireless/ath/ath9k/recv.c
++++ b/drivers/net/wireless/ath/ath9k/recv.c
+@@ -434,10 +434,13 @@ void ath_rx_cleanup(struct ath_softc *sc)
+ u32 ath_calcrxfilter(struct ath_softc *sc)
+ {
+ 	u32 rfilt;
+-
++	#ifndef _HOMESAW_
+ 	rfilt = ATH9K_RX_FILTER_UCAST | ATH9K_RX_FILTER_BCAST
+ 		| ATH9K_RX_FILTER_MCAST;
+-
++	#else
++	rfilt = ATH9K_RX_FILTER_UCAST | ATH9K_RX_FILTER_BCAST
++	  | ATH9K_RX_FILTER_MCAST| ATH9K_RX_FILTER_PHYERR  ; //_HOMESAW_          
++	#end
+ 	if (sc->rx.rxfilter & FIF_PROBE_REQ)
+ 		rfilt |= ATH9K_RX_FILTER_PROBEREQ;
+ 
+@@ -1763,6 +1766,97 @@ div_comb_done:
+ 	antcomb->alt_recv_cnt = 0;
+ }
+ 
++
++#ifdef _HOMESAW_
++
++/*
++This function manipulates the sk_buff datastructure to append all
++the interesting information from the driver all the way to userland.
++One has to play with the 40 sacred private bytes in sk_buff to do this, in essence.
++*/
++void ath_rx_radiotap(struct ath_softc *sc,
++                     struct sk_buff *skb,
++                     struct ath_rx_status *rs,
++                     u64 tsf)
++{ 
++  struct ath_common *common = ath9k_hw_common(sc->sc_ah);
++  struct ieee80211_rx_status *rxs = IEEE80211_SKB_RXCB(skb);
++  struct ieee80211_hw *hw = sc->hw;
++  struct ath9k_radiotap *rt;
++  struct ath_hw *ah = sc->sc_ah;
++  static phy_start=1;
++
++  int rt_len = sizeof(struct ath9k_radiotap)  ; //ath9k_radiotap_len(sc, rs);
++
++  if (skb_headroom(skb) < rt_len  &&
++      pskb_expand_head(skb, rt_len  , 0, GFP_ATOMIC)) {
++    static int askb=0;
++    if(askb<3)
++      printk("not enugh in ath9k %d\n",askb++);
++    ath_dbg(common, ATH_DBG_QUEUE, "No free space for vendor radiotap\n");
++    goto fail;
++  }
++
++  rxs->flag |= RX_FLAG_HOMESAW_RADIOTAP;
++
++  rt = (struct ath9k_radiotap *)skb_push(skb, rt_len);
++  memset(rt, 0, rt_len);
++  rt->hdr.it_len = cpu_to_le16(rt_len);
++  if (rxs->flag & RX_FLAG_HOMESAW_FAILED_PHY){
++    static int kk=0;
++    if (kk<5)
++      printk("abhinav: phy errs came here %d\n",kk++);
++  }
++
++  rt->hs.time_buf_dur_=tsf-rxs->mactime ;
++  if (rt->hs.time_buf_dur_ <0){
++    rt->hs.time_buf_dur_ = rxs->mactime-tsf ;
++  }
++  static int avb2=0;
++  if(avb2<5){
++    printk("abhinav: recv_buff %llu\n", rt->hs.time_buf_dur_) ;
++    if ((unsigned long)rt % __alignof__(struct ath9k_radiotap) == 0)
++      printk("abhinav: in driver align; latest driver \n");
++    avb2++;
++  }
++  /* OUI */
++  rt->oui[0] = 0xb;
++  rt->oui[1] = 0xb;
++  rt->oui[2] = 0xb;
++  rt->sub_namespace = 1;
++  rt->skip_length =cpu_to_le16(sizeof(struct homesaw));
++  rt->hdr.it_present = BIT(0) ;
++  rxs->vendor_radiotap_len = sizeof(struct homesaw);
++  rt->hs.caplen_ = rs->rs_datalen ;
++  if(rs->rs_rssi != ATH9K_RSSI_BAD && !rs->rs_moreaggr)
++    rt->hs.rssi_ = rs->rs_rssi;
++  else
++    rt->hs.rssi_ =  -127;
++
++  if (rs->rs_moreaggr)
++	  rxs->flag |=RX_FLAG_HOMESAW_RX_AGGR ;
++
++  if (unlikely(phy_start)){
++    ah->stats.prev_ast_ani_ofdmerrs = ah->stats.ast_ani_ofdmerrs ;
++    ah->stats.prev_ast_ani_cckerrs =  ah->stats.ast_ani_cckerrs ;
++	sc->debug.stats.rxstats.prev_phy_err= sc->debug.stats.rxstats.phy_err;
++    printk("abhinav: initializing phy errors \n");
++    phy_start=0;
++  }
++  rt->hs.ofdm_phyerr_ =  ah->stats.ast_ani_ofdmerrs -ah->stats.prev_ast_ani_ofdmerrs ;
++  rt->hs.cck_phyerr_ =  ah->stats.ast_ani_cckerrs -ah->stats.prev_ast_ani_cckerrs ;
++  rt->hs.phyerr_ = sc->debug.stats.rxstats.phy_err-sc->debug.stats.rxstats.prev_phy_err;
++  rt->hs.noise_ = ah->noise ;   
++  ah->stats.prev_ast_ani_ofdmerrs =ah->stats.ast_ani_ofdmerrs ;
++  ah->stats.prev_ast_ani_cckerrs =ah->stats.ast_ani_cckerrs ;
++  sc->debug.stats.rxstats.prev_phy_err =sc->debug.stats.rxstats.phy_err;
++
++ fail:
++  return ;
++}
++#endif
++
++
+ int ath_rx_tasklet(struct ath_softc *sc, int flush, bool hp)
+ {
+ 	struct ath_buf *bf;
+@@ -1887,6 +1981,14 @@ int ath_rx_tasklet(struct ath_softc *sc, int flush, bool hp)
+ 			bf->bf_mpdu = NULL;
+ 			bf->bf_buf_addr = 0;
+ 			ath_err(common, "dma_mapping_error() on RX\n");
++#ifdef _HOMESAW_
++            ath_rx_radiotap(sc,skb,&rs,tsf);
++            if(rxs->flag & RX_FLAG_FAILED_FCS_CRC){
++                static int l=0;
++                if(l<3)
++                printk("abhinav : crc flag set before brk %d\n",l++);
++            }
++#endif
+ 			ieee80211_rx(hw, skb);
+ 			break;
+ 		}
+@@ -1948,7 +2050,14 @@ int ath_rx_tasklet(struct ath_softc *sc, int flush, bool hp)
+ 
+ 		if ((ah->caps.hw_caps & ATH9K_HW_CAP_ANT_DIV_COMB) && sc->ant_rx == 3)
+ 			ath_ant_comb_scan(sc, &rs);
+-
++#ifdef _HOMESAW_
++        ath_rx_radiotap(sc,skb,&rs,tsf);
++        if(rxs->flag & RX_FLAG_FAILED_FCS_CRC){
++        static int l_end=0;
++        if (l_end<3)
++            printk("abhinav : crc flag set at end %d\n",l_end++ );
++        }
++#endif 
+ 		ieee80211_rx(hw, skb);
+ 
+ requeue_drop_frag:
+diff --git a/drivers/net/wireless/ath/ath9k/xmit.c b/drivers/net/wireless/ath/ath9k/xmit.c
+index 55d077e..809e95f 100644
+--- a/drivers/net/wireless/ath/ath9k/xmit.c
++++ b/drivers/net/wireless/ath/ath9k/xmit.c
+@@ -315,6 +315,9 @@ static struct ath_buf* ath_clone_txbuf(struct ath_softc *sc, struct ath_buf *bf)
+ 	tbf->bf_buf_addr = bf->bf_buf_addr;
+ 	memcpy(tbf->bf_desc, bf->bf_desc, sc->sc_ah->caps.tx_desc_len);
+ 	tbf->bf_state = bf->bf_state;
++	/*_HOMESAW_*/
++	tbf->timestamp_temp = bf->timestamp_temp;
++	tbf->enqueue_time = bf->enqueue_time;
+ 
+ 	return tbf;
+ }
+@@ -1625,6 +1628,17 @@ static void ath_tx_txqaddbuf(struct ath_softc *sc, struct ath_txq *txq,
+ 		txq->axq_link = bf_last->bf_desc;
+ 	}
+ 
++	/*_HOMESAW_*/
++	/*The frame is pushed to the hardware; Enqueue timestamp stored    
++	*/
++	int a_d =-1, d=0;
++	u64 time_now =  ath9k_hw_gettsf64(ah);
++	struct ath_buf *cur = bf;
++	while(cur) {			  
++		cur->enqueue_time = time_now;			    
++		cur = cur->bf_next ;				  				    
++	}
++
+ 	if (puttxbuf) {
+ 		TX_STAT_INC(txq->axq_qnum, puttxbuf);
+ 		ath9k_hw_puttxbuf(ah, txq->axq_qnum, bf->bf_daddr);
+@@ -2037,8 +2051,10 @@ static void ath_tx_rc_status(struct ath_softc *sc, struct ath_buf *bf,
+ 	struct ath_hw *ah = sc->sc_ah;
+ 	u8 i, tx_rateindex;
+ 
+-	if (txok)
+-		tx_info->status.ack_signal = ts->ts_rssi;
++
++	//if (txok) /*_HOMESAW_*/ commented out as we need space
++	//to get data out of driver to kernel
++	//	tx_info->status.ack_signal = ts->ts_rssi;
+ 
+ 	tx_rateindex = ts->ts_rateindex;
+ 	WARN_ON(tx_rateindex >= hw->max_rates);
+@@ -2089,6 +2105,23 @@ static void ath_tx_process_buffer(struct ath_softc *sc, struct ath_txq *txq,
+ {
+ 	int txok;
+ 
++	/*
++	abhinav's comment : This function seems like dequeue.
++	The depth of the transmit queue is decremented.
++	since ath_tx_status has all the retry counts information.
++	I calcaulate the total airtime for the frame by looping through
++	the retries, (1)the airtime for each transmision of the frame
++	(2) ACK time for
++	(3) SIFS between frames
++	(4) Last ACK 
++	*/
++	/*_HOMESAW_*/
++	
++    u64 deq_tsf;
++    struct ath_hw *ah = sc->sc_ah;
++    deq_tsf =ath9k_hw_gettsf64(ah);
++    bf->timestamp_temp =deq_tsf ;
++
+ 	txq->axq_depth--;
+ 	txok = !(ts->ts_status & ATH9K_TXERR_MASK);
+ 	txq->axq_tx_inprogress = false;
+diff --git a/include/net/ieee80211_radiotap.h b/include/net/ieee80211_radiotap.h
+index 7139254..3d2ea3c 100644
+--- a/include/net/ieee80211_radiotap.h
++++ b/include/net/ieee80211_radiotap.h
+@@ -205,6 +205,16 @@ enum ieee80211_radiotap_type {
+ 	IEEE80211_RADIOTAP_DATA_RETRIES = 17,
+ 
+ 	IEEE80211_RADIOTAP_MCS = 19,
++	//_HOMESAW_
++	IEEE80211_RADIOTAP_PHYERR_COUNT = 20, // For DMA counts; Check driver code for checking which flags were on
++	IEEE80211_RADIOTAP_CCK_PHYERR_COUNT = 21, // For CCK counts; 
++	IEEE80211_RADIOTAP_OFDM_PHYERR_COUNT = 22, // For OFDM counts; Frames with OFDM endoding and were in error in physical layer
++	IEEE80211_RADIOTAP_TOTAL_TIME=23, // Time spend in hardware queue. Will give fine grained time information on Contention
++	IEEE80211_RADIOTAP_QUEUE_SIZES=24, // The size of the queues
++	IEEE80211_RADIOTAP_COLLECTION=25,
++	IEEE80211_RADIOTAP_CAPLEN = 26, //redundant information, this flag can be used for some other interesting information
++	IEEE80211_RADIOTAP_RSSI = 27, 
++	IEEE80211_RADIOTAP_RATES_TRIED=28, // The order of rates and the number of retries on each while the device transmitted a payload
+ 
+ 	/* valid in every it_present bitmap, even vendor namespaces */
+ 	IEEE80211_RADIOTAP_RADIOTAP_NAMESPACE = 29,
+@@ -237,6 +247,12 @@ enum ieee80211_radiotap_type {
+ 						 * with fragmentation
+ 						 */
+ #define	IEEE80211_RADIOTAP_F_FCS	0x10	/* frame includes FCS */
++
++
++#define IEEE80211_RADIOTAP_F_HOMESAW_FAILED_PHY 0x20; /*frame has PHY ERR*/
++#define IEEE80211_RADIOTAP_F_HOMESAW_RX_AGG 0x10 /* received frame was aggregated frame */
++
++
+ #define	IEEE80211_RADIOTAP_F_DATAPAD	0x20	/* frame has padding between
+ 						 * 802.11 header and payload
+ 						 * (to 32-bit boundary)
+@@ -253,6 +269,8 @@ enum ieee80211_radiotap_type {
+ #define IEEE80211_RADIOTAP_F_TX_RTS	0x0004	/* used rts/cts handshake */
+ #define IEEE80211_RADIOTAP_F_TX_NOACK	0x0008	/* don't expect an ack */
+ 
++#define IEEE80211_RADIOTAP_F_TX_AGG 0x40  /* _HOMESAW_ transmitted frame was aggregated or not. 
++Understand the HT Minstrel algorithm to find out how this flag is set */
+ 
+ /* For IEEE80211_RADIOTAP_MCS */
+ #define IEEE80211_RADIOTAP_MCS_HAVE_BW		0x01
+diff --git a/include/net/mac80211.h b/include/net/mac80211.h
+index 48953e2..bc0e0d5 100644
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -557,11 +557,22 @@ struct ieee80211_tx_info {
+ 			struct ieee80211_sta *sta;
+ 		} control;
+ 		struct {
+-			struct ieee80211_tx_rate rates[IEEE80211_TX_MAX_RATES];
+-			u8 ampdu_ack_len;
+-			int ack_signal;
+-			u8 ampdu_len;
+-			/* 15 bytes free */
++		  struct ieee80211_tx_rate rates[IEEE80211_TX_MAX_RATES];
++		  u8 ampdu_ack_len;
++		  //int ack_signal;
++          /*
++          They are used to get the data frome the ath9k driver 
++          to the kernel on the transmission side of frames.
++          */
++		  u64 timestamp_tx; /*HOMESAW*/
++		  u32 total_time;  //difference between enqueueing and dequeueing in hardare queues
++		  u16 ampdu_qsize; //The size of the 802.11 n ampdu. Its maximum size was 2 (as later verified by Felix)
++		  u16 mpdu_qsize;  //The size of mpdu (most of the frames are not aggregated)
++		  u8 ath_qnum;     // maps to 802.11 queues for traffic QoS
++		  u8 tx_aggr_flag; // Flag to the mpdu received in userland was a part of AMPDU or not
++		  u8 phy_flag;
++		  u8 ampdu_len;
++		  /* 15 bytes free ; not now ;) */
+ 		} status;
+ 		struct {
+ 			struct ieee80211_tx_rate driver_rates[
+@@ -672,6 +683,11 @@ enum mac80211_rx_flags {
+ 	RX_FLAG_HT		= 1<<9,
+ 	RX_FLAG_40MHZ		= 1<<10,
+ 	RX_FLAG_SHORT_GI	= 1<<11,
++	RX_FLAG_HOMESAW_RADIOTAP =1<<12,
++	RX_FLAG_HOMESAW_FAILED_PHY=1<<13, // for the CCK, OFDM and DMA failed CRC frame counts. They indicate the 
++    // which were probably not even frames, but some fluctuation which was above the senstivity level of ath9k driver.
++	RX_FLAG_HOMESAW_RX_AGGR=1<<14, //received frame was aggregated or not
++
+ };
+ 
+ /**
+@@ -703,6 +719,7 @@ struct ieee80211_rx_status {
+ 	int rate_idx;
+ 	int flag;
+ 	unsigned int rx_flags;
++    int vendor_radiotap_len ;//_HOMESAW_ // used in journey from ath9k driver to kernel
+ };
+ 
+ /**
+diff --git a/net/mac80211/rx.c b/net/mac80211/rx.c
+index ddddfbb..9ecd051 100644
+--- a/net/mac80211/rx.c
++++ b/net/mac80211/rx.c
+@@ -29,6 +29,37 @@
+ #include "tkip.h"
+ #include "wme.h"
+ 
++
++
++#ifndef _HOMESAW_
++//#define abhinav
++#define _HOMESAW_
++#endif
++
++#ifdef _HOMESAW_
++struct homesaw{
++  u_int32_t phyerr_; // capturing phy errrors which are DMAed from device to the kernel
++  u_int32_t cck_phyerr_; // PHY errors due  in CCK encoding
++  u_int32_t ofdm_phyerr_; // PHY errors due in OFDM encoding
++  u_int32_t time_buf_dur_;// time difference between enqueuing and dequeuing in hardware buffer
++
++  u_int16_t caplen_ ; //capture length of 
++  int8_t rssi_ ; // RSSI reported by the driver (measured in dBm)
++  s8 noise_ ; // Noise floor caliberated by the driver (measured in dBm)
++} __packed ;
++struct ath9k_radiotap {
++  struct ieee80211_radiotap_header hdr;
++
++  /* Vendor extension header */
++  u8 oui[3]; // added for tcpdump, Wireshark parser's don't break
++  u8 sub_namespace;
++  __le16 skip_length;
++  struct homesaw hs ; // header containing required information
++  //{put your additional field here properly padded per radiotap spec}
++
++} __packed;
++#endif
++
+ /*
+  * monitor mode reception
+  *
+@@ -38,12 +69,33 @@
+ static struct sk_buff *remove_monitor_info(struct ieee80211_local *local,
+ 					   struct sk_buff *skb)
+ {
++
++#ifdef _HOMESAW_  
++  struct ath9k_radiotap* a9k_rthdr ;
++  struct ieee80211_radiotap_header *rthdr;
++  int len ;
++  static int db=0;
++  struct ieee80211_rx_status *status = IEEE80211_SKB_RXCB(skb);
++  if (status->flag & RX_FLAG_HOMESAW_RADIOTAP) {
++    rthdr = (struct ieee80211_radiotap_header *) skb->data;
++    a9k_rthdr = (struct ath9k_radiotap *) skb->data;
++    len= le16_to_cpu(rthdr->it_len) ;
++    if (likely(len > FCS_LEN))
++      __pskb_pull(skb,len);
++  }
++#endif
++
+ 	if (local->hw.flags & IEEE80211_HW_RX_INCLUDES_FCS) {
+ 		if (likely(skb->len > FCS_LEN))
+ 			__pskb_trim(skb, skb->len - FCS_LEN);
+ 		else {
+ 			/* driver bug */
++#ifndef _HOMESAW_
+ 			WARN_ON(1);
++#else
++			printk("abhinav: driver bug exists! %d\n",db++);
++
++#end 
+ 			dev_kfree_skb(skb);
+ 			skb = NULL;
+ 		}
+@@ -88,8 +140,24 @@ ieee80211_rx_radiotap_len(struct ieee80211_local *local,
+ 
+ 	if (status->flag & RX_FLAG_HT) /* HT info */
+ 		len += 3;
+-
++#ifdef _HOMESAW_
++	if (status->vendor_radiotap_len) {
++        static int al=0;
++	  /* align standard part of vendor namespace */
++	  len = ALIGN(len, 2);
++	  /* allocate standard part of vendor namespace */
++	  len += 6;
++	  /* align vendor-defined part */
++	  len +=sizeof(struct homesaw);
++	  if (al<5)
++	    printk("abhinav:eventual len = %d %d\n",len,al++);
++	}
++	return 58;
++#else 
+ 	return len;
++#endif
++	
++	
+ }
+ 
+ /*
+@@ -105,6 +173,38 @@ ieee80211_add_rx_radiotap_header(struct ieee80211_local *local,
+ {
+ 	struct ieee80211_rx_status *status = IEEE80211_SKB_RXCB(skb);
+ 	struct ieee80211_radiotap_header *rthdr;
++	#ifdef _HOMESAW_
++    /*This part of code populates the actual radiotap header which is read
++    in userspace. It is populated from the header that was filled in driver
++    which is pealed off here and the memory reused for radiotap header */
++	struct ath9k_radiotap* a9k_rthdr ;
++	struct ath9k_radiotap *a9k_t;
++	struct ath9k_radiotap a9k ;
++	a9k_t = (struct ath9k_radiotap*) skb->data ;
++	memset(&a9k,0,sizeof(struct ath9k_radiotap));
++	a9k.hdr.it_present = a9k_t->hdr.it_present ;
++	a9k.oui[0]=a9k_t->oui[0]; //as per Radiotap spec. WireShark
++	a9k.oui[1]=a9k_t->oui[1]; // looks for this. Tcpdump parser is not so sophisticated,
++	a9k.oui[2]=a9k_t->oui[2]; // Tcpdump 4.1+ parser code is the same as Wirelshark
++	a9k.sub_namespace= a9k_t->sub_namespace;
++	a9k.skip_length =a9k_t->skip_length ;
++	a9k.hs.phyerr_  = a9k_t->hs.phyerr_  ;
++	a9k.hs.cck_phyerr_ = a9k_t->hs.cck_phyerr_ ;
++	a9k.hs.ofdm_phyerr_ = a9k_t->hs.ofdm_phyerr_ ;
++	a9k.hs.caplen_ =  a9k_t->hs.caplen_ ;
++	a9k.hs.rssi_ = a9k_t->hs.rssi_ ;
++	a9k.hs.noise_ =  a9k_t->hs.noise_ ;
++	a9k.hs.time_buf_dur_=a9k_t->hs.time_buf_dur_ ;
++	u16 len;
++
++	if (status->flag & RX_FLAG_HOMESAW_RADIOTAP) {
++	  rthdr = (struct ieee80211_radiotap_header *) skb->data;
++	  a9k_rthdr = (struct ath9k_radiotap *) skb->data;
++	  len= le16_to_cpu(rthdr->it_len) ;
++	  if (likely(len > FCS_LEN))
++	    __pskb_pull(skb,len);
++	}
++	#endif
+ 	unsigned char *pos;
+ 	u16 rx_flags = 0;
+ 
+@@ -116,7 +216,10 @@ ieee80211_add_rx_radiotap_header(struct ieee80211_local *local,
+ 		cpu_to_le32((1 << IEEE80211_RADIOTAP_FLAGS) |
+ 			    (1 << IEEE80211_RADIOTAP_CHANNEL) |
+ 			    (1 << IEEE80211_RADIOTAP_ANTENNA) |
+-			    (1 << IEEE80211_RADIOTAP_RX_FLAGS));
++			    (1 << IEEE80211_RADIOTAP_RX_FLAGS) // for WireShark and Tcpdump parser
++			    | (1 << IEEE80211_RADIOTAP_VENDOR_NAMESPACE)
++			    | (1 << IEEE80211_RADIOTAP_EXT)
++			    );
+ 	rthdr->it_len = cpu_to_le16(rtap_len);
+ 
+ 	pos = (unsigned char *)(rthdr+1);
+@@ -181,7 +284,13 @@ ieee80211_add_rx_radiotap_header(struct ieee80211_local *local,
+ 			cpu_to_le32(1 << IEEE80211_RADIOTAP_DBM_ANTSIGNAL);
+ 		pos++;
+ 	}
+-
++	/* IEEE80211_RADIOTAP_DBM_ANTNOISE */
++	#ifdef _HOMESAW_
++	rthdr->it_present |=
++	  cpu_to_le32(1 << IEEE80211_RADIOTAP_DBM_ANTNOISE);
++	*pos=a9k.hs.noise_;
++	pos++;
++	#endif
+ 	/* IEEE80211_RADIOTAP_LOCK_QUALITY is missing */
+ 
+ 	/* IEEE80211_RADIOTAP_ANTENNA */
+@@ -212,6 +321,52 @@ ieee80211_add_rx_radiotap_header(struct ieee80211_local *local,
+ 		pos++;
+ 		*pos++ = status->rate_idx;
+ 	}
++
++#ifdef  _HOMESAW_
++
++	if (status->vendor_radiotap_len) {
++	  /* ensure 2 byte alignment for the vendor field as required */
++	  /* if ((pos - (u8 *)rthdr) & 1) {
++	   *pos++ = 0;
++	   static int k=0;
++	   if (k<3){
++	   printk("abhinav: allignment cared %d \n",k++);
++	   }
++	  */
++	  *pos++ = a9k.oui[0];
++	  *pos++ = a9k.oui[1];
++	  *pos++ = a9k.oui[2];
++	  *pos++ = a9k.sub_namespace;
++	  put_unaligned_le16(a9k.skip_length, pos);
++	  pos += 2;
++	  rthdr->it_present |= cpu_to_le32(1 << IEEE80211_RADIOTAP_PHYERR_COUNT);
++	  put_unaligned_le32(a9k.hs.phyerr_,pos);
++	  pos +=4 ;
++	  rthdr->it_present |= cpu_to_le32(1 << IEEE80211_RADIOTAP_CCK_PHYERR_COUNT);
++	  put_unaligned_le32(a9k.hs.cck_phyerr_,pos);
++	  pos +=4 ;
++	  rthdr->it_present |= cpu_to_le32(1 <<IEEE80211_RADIOTAP_OFDM_PHYERR_COUNT);
++	  put_unaligned_le32(a9k.hs.ofdm_phyerr_,pos);
++	  pos +=4 ;
++	  rthdr->it_present |= cpu_to_le32(1 <<IEEE80211_RADIOTAP_TOTAL_TIME);
++	  put_unaligned_le32(a9k.hs.time_buf_dur_,pos);
++	  pos +=4;
++	  rthdr->it_present |= cpu_to_le32(1 << IEEE80211_RADIOTAP_CAPLEN);
++	  put_unaligned_le16(a9k.hs.caplen_,pos) ;
++	  pos +=2 ;
++	  rthdr->it_present |= cpu_to_le32(1 << IEEE80211_RADIOTAP_RSSI);
++	  *pos = a9k.hs.rssi_ ;
++	  pos++;
++	  static int caleb=0;
++	  if (caleb <5)
++	    printk("abhinav: header %d %d\n",pos-(unsigned char*)rthdr,caleb++);
++	}
++
++#endif
++
++
++
++
+ }
+ 
+ /*
+diff --git a/net/mac80211/status.c b/net/mac80211/status.c
+index a9da6ee..29ba0aa 100644
+--- a/net/mac80211/status.c
++++ b/net/mac80211/status.c
+@@ -16,6 +16,7 @@
+ #include "mesh.h"
+ #include "led.h"
+ #include "wme.h"
++#define _HOMESAW_
+ 
+ 
+ void ieee80211_tx_status_irqsafe(struct ieee80211_hw *hw,
+@@ -248,13 +249,27 @@ static int ieee80211_tx_radiotap_len(struct ieee80211_tx_info *info)
+ 	if (info->status.rates[0].idx >= 0 &&
+ 	    info->status.rates[0].flags & IEEE80211_TX_RC_MCS)
+ 		len += 3;
+-
++#ifdef _HOMESAW_
++	len +=8;
++	len +=10;
++	len +=7;
++	static int gore=0;
++	if (gore <5) {
++	  printk("abhinav:tx len=%d %d\n",len,gore++);
++	}
++	return 48;
++#endif
+ 	return len;
+ }
+ 
+ static void ieee80211_add_tx_radiotap_header(struct ieee80211_supported_band
+ 					     *sband, struct sk_buff *skb,
+-					     int retry_count, int rtap_len)
++					     int retry_count, int rtap_len
++#ifdef _HOMESAW_
++					     , struct ieee80211_hw* hw
++#endif
++					     )
++
+ {
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+ 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *) skb->data;
+@@ -322,6 +337,43 @@ static void ieee80211_add_tx_radiotap_header(struct ieee80211_supported_band
+ 		pos[2] = info->status.rates[0].idx;
+ 		pos += 3;
+ 	}
++#ifdef _HOMESAW_
++	rthdr->it_present |= cpu_to_le32(1 << IEEE80211_RADIOTAP_TOTAL_TIME);
++	put_unaligned_le64(info->status.total_time,pos);
++	pos +=4;
++
++	rthdr->it_present |= cpu_to_le32(1 << IEEE80211_RADIOTAP_QUEUE_SIZES);
++	put_unaligned_le16(info->status.mpdu_qsize,pos);
++	pos +=2;
++	put_unaligned_le16(info->status.ampdu_qsize,pos);
++	pos +=2;
++	rthdr->it_present |= cpu_to_le32(1 << IEEE80211_RADIOTAP_COLLECTION);
++	*pos=info->status.phy_flag;
++	pos++;
++	*pos=info->status.ath_qnum;
++	pos++;
++	unsigned char * temp=pos ;
++	int i ;
++	rthdr->it_present |= cpu_to_le32(1 << IEEE80211_RADIOTAP_RATES_TRIED);
++	for (i = 0; i < IEEE80211_TX_MAX_RATES; i++) {
++	  if (info->status.rates[i].idx < 0) {
++	    break;
++	  } else if (i >= hw->max_report_rates) {
++	    /* the HW cannot have attempted that rate */
++	    //info->status.rates[i].idx = -1;
++	    //info->status.rates[i].count = 0;
++	    break;
++	  }
++	  *pos= info->status.rates[i].idx;
++	  pos++;
++	  *pos= info->status.rates[i].count ;
++	  pos++;
++	  *pos= info->status.rates[i].flags;
++	  pos++;
++	}
++	pos= temp+15;
++	*pos=0x9;
++#endif
+ 
+ }
+ 
+@@ -585,12 +637,24 @@ void ieee80211_tx_status(struct ieee80211_hw *hw, struct sk_buff *skb)
+ 
+ 	/* send frame to monitor interfaces now */
+ 	rtap_len = ieee80211_tx_radiotap_len(info);
++#ifndef _HOMESAW_
+ 	if (WARN_ON_ONCE(skb_headroom(skb) < rtap_len)) {
+ 		printk(KERN_ERR "ieee80211_tx_status: headroom too small\n");
++#else
++	if(pskb_expand_head(skb, rtap_len, 0, GFP_ATOMIC)<0){
++		printk(KERN_ERR "ieee80211_tx_status: can't allocate headroom for HOMESAW\n");
++#endif
++
+ 		dev_kfree_skb(skb);
+ 		return;
+ 	}
+-	ieee80211_add_tx_radiotap_header(sband, skb, retry_count, rtap_len);
++	ieee80211_add_tx_radiotap_header(sband, skb, retry_count, rtap_len
++#ifdef _HOMESAW_
++	,hw);
++#else
++	);
++#endif
++
+ 
+ 	/* XXX: is this sufficient for BPF? */
+ 	skb_set_mac_header(skb, 0);
